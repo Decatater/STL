@@ -814,23 +814,12 @@ function exportCircleData() {
     }
 
     const faceGroups = groupHolesByFace(detectedCircles);
-
+    
     const data = {
         faces: faceGroups.map((group, faceIndex) => {
-            const faceNormal = group[0]?.normal || { x: 0, y: 0, z: 0 };
-
-            // Compare exact normal vectors (allowing for negative alignment)
-            const isTop = topFaceNormal ?
-                (Math.abs(faceNormal.x - topFaceNormal.x) < 0.05 &&
-                    Math.abs(faceNormal.y - topFaceNormal.y) < 0.05 &&
-                    Math.abs(faceNormal.z - topFaceNormal.z) < 0.05) ||
-                (Math.abs(faceNormal.x + topFaceNormal.x) < 0.05 &&
-                    Math.abs(faceNormal.y + topFaceNormal.y) < 0.05 &&
-                    Math.abs(faceNormal.z + topFaceNormal.z) < 0.05) : false;
-
+            const faceNormal = group[0]?.normal || {x: 0, y: 0, z: 0};
             return {
                 faceId: faceIndex + 1,
-                isTopFace: isTop,
                 normal: {
                     x: Math.round(faceNormal.x * 100) / 100,
                     y: Math.round(faceNormal.y * 100) / 100,
@@ -854,33 +843,20 @@ function exportCircleData() {
                 }))
             };
         }),
-        selectedFace: topFaceNormal ? {
+        orientationFace: {
             normal: {
                 x: Math.round(topFaceNormal.x * 100) / 100,
                 y: Math.round(topFaceNormal.y * 100) / 100,
                 z: Math.round(topFaceNormal.z * 100) / 100
             },
             rotation: calculateRotation(topFaceNormal)
-        } : null,
-        topFaceNormal: topFaceNormal ? {
-            x: Math.round(topFaceNormal.x * 100) / 100,
-            y: Math.round(topFaceNormal.y * 100) / 100,
-            z: Math.round(topFaceNormal.z * 100) / 100
-        } : null,
+        },
         totalHoles: detectedCircles.length,
         timestamp: new Date().toISOString()
     };
 
     const fileName = document.getElementById('fileInput').files[0].name;
     const jsonFileName = fileName.replace(/\.stl$/i, '.json');
-
-    console.log('Face normals comparison:', {
-        topFaceNormal: data.topFaceNormal,
-        faces: data.faces.map(f => ({
-            normal: f.normal,
-            isTop: f.isTopFace
-        }))
-    });
 
     const blob = new Blob([JSON.stringify(data, null, 2)], { type: 'application/json' });
     const url = URL.createObjectURL(blob);
