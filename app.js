@@ -295,9 +295,14 @@ function calculateDistances(circles) {
 }
 
 function detectCircle(point, normal, geometry) {
+    // Print initial hit information
+    console.log('Hit point:', point);
+    console.log('Surface normal:', normal);
+    console.log('Distance from camera:', point.distanceTo(camera.position));
+
     // Create local coordinate system
     const basis = createLocalBasis(normal);
-    const searchRadius = 8; // Increased search radius
+    const searchRadius = 6;
 
     // Pre-allocate vectors for reuse
     const vertex = new THREE.Vector3();
@@ -305,54 +310,123 @@ function detectCircle(point, normal, geometry) {
     const toPoint = new THREE.Vector3();
     const projectedPoint = new THREE.Vector3();
 
-    // Build point cloud
+    // Build point cloud with debug info
     const candidatePoints = [];
     const positions = geometry.attributes.position;
     const vertexNormals = geometry.attributes.normal;
 
-    // Collect points near the click
+    // Less strict normal check for chamfered holes
+    let similarNormalCount = 0;
+    const normalTolerance = 0.85;  // More forgiving angle for chamfer
+
+    // Track points in different distance ranges
+    let pointsNear = 0;
+    let pointsMid = 0;
+    let pointsFar = 0;
+
     for (let i = 0; i < positions.count; i++) {
         vertex.fromBufferAttribute(positions, i);
         vertex.applyMatrix4(model.matrixWorld);
 
-        const distance = vertex.distanceTo(point);
-        if (distance > searchRadius) continue;
+        // Track points by distance
+        const distToCamera = vertex.distanceTo(camera.position);
+        if (distToCamera < 5) pointsNear++;
+        else if (distToCamera < 10) pointsMid++;
+        else pointsFar++;
 
         vertNormal.fromBufferAttribute(vertexNormals, i);
         vertNormal.applyMatrix3(model.normalMatrix);
         vertNormal.normalize();
 
+        const normalAlignment = Math.abs(vertNormal.dot(normal));
+        if (normalAlignment > normalTolerance) {
+            similarNormalCount++;
+        }
+    }
+
+    console.log('Points by distance:', {
+        near: pointsNear,
+        mid: pointsMid,
+        far: pointsFar
+    });
+    console.log('Similar normal count:', similarNormalCount);
+
+    if (similarNormalCount < 10) {
+        console.log('Not enough points with similar normals');
+        return null;
+    }
+
+    // Two-phase point collection to handle chamfer
+    const initialCandidates = [];
+    
+    // First phase: collect all nearby points with relaxed normal check
+    let pointsRejectedByDistance = 0;
+    let pointsRejectedByNormal = 0;
+    let pointsRejectedByPlane = 0;
+
+    for (let i = 0; i < positions.count; i++) {
+        vertex.fromBufferAttribute(positions, i);
+        vertex.applyMatrix4(model.matrixWorld);
+
+        const distance = vertex.distanceTo(point);
+        if (distance > searchRadius) {
+            pointsRejectedByDistance++;
+            continue;
+        }
+
+        vertNormal.fromBufferAttribute(vertexNormals, i);
+        vertNormal.applyMatrix3(model.normalMatrix);
+        vertNormal.normalize();
+
+        const normalAlignment = Math.abs(vertNormal.dot(normal));
+        if (normalAlignment < normalTolerance) {
+            pointsRejectedByNormal++;
+            continue;
+        }
+
         toPoint.copy(vertex).sub(point);
         const distanceToPlane = toPoint.dot(normal);
 
-        // Consider points near the plane
-        if (Math.abs(distanceToPlane) > 0.5) continue;
+        if (Math.abs(distanceToPlane) > 0.7) {
+            pointsRejectedByPlane++;
+            continue;
+        }
 
-        // Project point to plane
         projectedPoint.copy(vertex).sub(normal.clone().multiplyScalar(distanceToPlane));
+        const projectedDist = projectedPoint.distanceTo(point);
+        if (projectedDist > searchRadius) continue;
 
-        // Convert to 2D coordinates on plane using the basis vectors
         const localX = projectedPoint.clone().sub(point).dot(basis.tangent);
         const localY = projectedPoint.clone().sub(point).dot(basis.bitangent);
 
-        candidatePoints.push({
+        initialCandidates.push({
             x: localX,
             y: localY,
             original: vertex.clone(),
-            normal: vertNormal.clone()
+            normal: vertNormal.clone(),
+            normalAlignment: normalAlignment,
+            distanceToPlane: Math.abs(distanceToPlane)
         });
     }
 
-    console.log(`Found ${candidatePoints.length} candidate points`);
-    if (candidatePoints.length < 20) return null;
+    console.log('Points rejected:', {
+        byDistance: pointsRejectedByDistance,
+        byNormal: pointsRejectedByNormal,
+        byPlane: pointsRejectedByPlane
+    });
 
-    // Try to find circular patterns using RANSAC-like approach
+    // Sort points by normal alignment and keep the best ones
+    candidatePoints.push(...initialCandidates.sort((a, b) => b.normalAlignment - a.normalAlignment).slice(0, Math.max(20, initialCandidates.length / 2)));
+
+    console.log(`Found ${candidatePoints.length} final candidate points`);
+    if (candidatePoints.length < 15) return null;
+
+    // Rest of the circle detection code remains the same
     let bestCircle = null;
     let bestScore = 0;
     const maxAttempts = 100;
 
     for (let attempt = 0; attempt < maxAttempts; attempt++) {
-        // Pick three random points to define a circle
         const indices = [];
         while (indices.length < 3) {
             const idx = Math.floor(Math.random() * candidatePoints.length);
@@ -363,7 +437,6 @@ function detectCircle(point, normal, geometry) {
         const p2 = candidatePoints[indices[1]];
         const p3 = candidatePoints[indices[2]];
 
-        // Calculate circle through these points
         const temp = p2.x * p2.x + p2.y * p2.y;
         const bc = (p1.x * p1.x + p1.y * p1.y - temp) / 2.0;
         const cd = (temp - p3.x * p3.x - p3.y * p3.y) / 2.0;
@@ -375,11 +448,12 @@ function detectCircle(point, normal, geometry) {
         const cy = ((p1.x - p2.x) * cd - (p2.x - p3.x) * bc) / det;
         const radius = Math.sqrt((p1.x - cx) * (p1.x - cx) + (p1.y - cy) * (p1.y - cy));
 
-        if (radius < 1.5 || radius > 5) continue;
+        if (radius < 1.5 || radius > 5.5) continue;
 
         let pointsOnCircle = 0;
+        let weightedPointsOnCircle = 0;
         const angles = new Set();
-        const tolerance = 0.2;
+        const tolerance = 0.25;
 
         for (const p of candidatePoints) {
             const dx = p.x - cx;
@@ -390,25 +464,24 @@ function detectCircle(point, normal, geometry) {
                 const angle = Math.floor((Math.atan2(dy, dx) + Math.PI) * 16 / (2 * Math.PI));
                 angles.add(angle);
                 pointsOnCircle++;
+                weightedPointsOnCircle += p.normalAlignment;
             }
         }
 
-        const score = (pointsOnCircle / candidatePoints.length) * (angles.size / 16);
+        const score = (weightedPointsOnCircle / (candidatePoints.length * 0.95)) * (angles.size / 16);
 
-        if (score > bestScore && angles.size >= 12) {
+        if (score > bestScore && angles.size >= 10) {
             bestScore = score;
             bestCircle = { x: cx, y: cy, radius: radius };
+            console.log(`New best circle - R:${radius.toFixed(2)}mm, Score:${bestScore.toFixed(2)}, Points:${pointsOnCircle}, Angles:${angles.size}`);
         }
     }
 
-    if (!bestCircle || bestScore < 0.3) {
+    if (!bestCircle || bestScore < 0.25) {
         console.log(`No good circle found. Best score: ${bestScore}`);
         return null;
     }
 
-    console.log(`Found circle with radius ${bestCircle.radius}mm and score ${bestScore}`);
-
-    // Convert back to 3D using basis vectors
     const center3D = point.clone()
         .add(basis.tangent.multiplyScalar(bestCircle.x))
         .add(basis.bitangent.multiplyScalar(bestCircle.y));
@@ -420,7 +493,6 @@ function detectCircle(point, normal, geometry) {
         quality: bestScore
     };
 }
-
 function createLocalBasis(normal) {
     // Create a proper orthonormal basis aligned with the face
     const tangent = new THREE.Vector3();
