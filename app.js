@@ -9,6 +9,10 @@ let selectionMode = false;
 let highlightedFace = null;
 let topFaceNormal = null;
 let topFaceHighlight = null;
+let slideFacesMode = false;
+let slideFaces = [];  // Just a simple array of faces
+let currentSlideGroup = null;
+let slideFaceHighlights = [];
 
 init();
 animate();
@@ -52,6 +56,313 @@ function init() {
     document.getElementById('exportData').addEventListener('click', exportCircleData);
     document.getElementById('clearAll').addEventListener('click', clearAllCircles);
     document.getElementById('selectFace').addEventListener('click', toggleFaceSelection);
+    
+    // Add new event listener for slide faces button
+    document.getElementById('selectSlideFaces').addEventListener('click', toggleSlideFacesMode);
+}
+// Add new function for slide face selection mode
+function toggleSlideFacesMode() {
+    slideFacesMode = !slideFacesMode;
+    const button = document.getElementById('selectSlideFaces');
+    
+    if (slideFacesMode) {
+        button.style.background = '#ff4444';
+        button.textContent = 'Cancel Slide Face Selection';
+        updateStatus('Click faces to select slide faces');
+    } else {
+        button.style.background = '#2196f3';
+        button.textContent = 'Select Slide Faces';
+        updateStatus('Slide face selection cancelled');
+        
+        if (highlightedFace) {
+            scene.remove(highlightedFace);
+            highlightedFace = null;
+        }
+    }
+}
+
+// Function to handle finishing a slide face group
+function finishSlideGroup(event) {
+    if (!slideFacesMode || event.key !== 'Enter' || !currentSlideGroup?.length) return;
+    
+    slideFaces.push([...currentSlideGroup]);
+    currentSlideGroup = [];
+    
+    updateStatus('Slide face group added. Start new group or toggle off to finish.');
+    updateSlideList();
+}
+
+// Function to add a face to the current slide group
+function addSlideface(normal, point) {
+    const highlight = createFaceHighlight(normal, point, 0x4169E1, 0.15);
+    
+    if (highlight && highlight.userData.dimensions) {
+        const face = {
+            normal: normal.clone(),
+            point: point.clone(),
+            highlight: highlight,
+            dimensions: highlight.userData.dimensions
+        };
+
+        slideFaces.push(face);
+        scene.add(highlight);
+        updateSlideList();
+        updateStatus(`Face added: ${face.dimensions.width.toFixed(2)}mm × ${face.dimensions.height.toFixed(2)}mm`);
+    } else {
+        updateStatus('Failed to detect face dimensions');
+    }
+}
+// New function to calculate face dimensions
+function calculateFaceDimensions(normal, point) {
+    const positions = model.geometry.attributes.position;
+    const worldMatrix = model.matrixWorld;
+    const vertex = new THREE.Vector3();
+    const points = [];
+    const tolerance = 0.1;
+
+    // Collect points on this face
+    for (let i = 0; i < positions.count; i++) {
+        vertex.fromBufferAttribute(positions, i);
+        vertex.applyMatrix4(worldMatrix);
+
+        const toPoint = vertex.clone().sub(point);
+        const dist = Math.abs(toPoint.dot(normal));
+
+        if (dist < tolerance) {
+            points.push(vertex);
+        }
+    }
+
+    if (points.length > 0) {
+        const basis = createLocalBasis(normal);
+        let minX = Infinity, maxX = -Infinity;
+        let minY = Infinity, maxY = -Infinity;
+
+        points.forEach(p => {
+            const localPoint = p.clone().sub(point);
+            const x = localPoint.dot(basis.tangent);
+            const y = localPoint.dot(basis.bitangent);
+
+            minX = Math.min(minX, x);
+            maxX = Math.max(maxX, x);
+            minY = Math.min(minY, y);
+            maxY = Math.max(maxY, y);
+        });
+
+        return {
+            width: Math.round((maxX - minX) * 100) / 100,
+            height: Math.round((maxY - minY) * 100) / 100,
+            center2D: {
+                x: Math.round(((maxX + minX) / 2) * 100) / 100,
+                y: Math.round(((maxY + minY) / 2) * 100) / 100
+            },
+            bounds2D: {
+                min: { x: Math.round(minX * 100) / 100, y: Math.round(minY * 100) / 100 },
+                max: { x: Math.round(maxX * 100) / 100, y: Math.round(maxY * 100) / 100 }
+            }
+        };
+    }
+
+    return null;
+}
+
+// Helper function to create face highlight mesh
+function createFaceHighlight(normal, point, color, opacity) {
+    if (!model || !model.geometry) return null;
+    
+    const raycaster = new THREE.Raycaster();
+    raycaster.ray.origin.copy(camera.position);
+    raycaster.ray.direction.subVectors(point, camera.position).normalize();
+    
+    const intersects = raycaster.intersectObject(model);
+    if (!intersects.length) return null;
+
+    const basis = createLocalBasis(normal);
+    const samplePoints = new Set();
+    const checkedPoints = new Set();
+    const pointsToCheck = new Set();
+    const gridSize = 0.25;  // Sample every 0.25mm
+    const normalDotThreshold = 0.99;  // Back to original threshold
+    const planeTolerance = 0.1;  // Back to original tolerance
+    
+    // Add initial point with its face normal
+    const initialPoint = {
+        x: 0,
+        y: 0,
+        point: point.clone(),
+        normal: intersects[0].face.normal.clone()
+    };
+    pointsToCheck.add(JSON.stringify(initialPoint));
+    
+    // Flood fill sampling
+    while (pointsToCheck.size > 0) {
+        const currentPointStr = pointsToCheck.values().next().value;
+        pointsToCheck.delete(currentPointStr);
+        
+        const current = JSON.parse(currentPointStr);
+        const checkedKey = `${current.x},${current.y}`;
+        if (checkedPoints.has(checkedKey)) continue;
+        checkedPoints.add(checkedKey);
+        
+        // Test this point
+        const testPoint = point.clone()
+            .add(basis.tangent.clone().multiplyScalar(current.x * gridSize))
+            .add(basis.bitangent.clone().multiplyScalar(current.y * gridSize));
+        
+        // Cast ray at this point
+        raycaster.ray.origin.copy(testPoint.clone().add(normal.clone().multiplyScalar(0.5)));
+        raycaster.ray.direction.copy(normal).negate();
+        
+        const hit = raycaster.intersectObject(model);
+        if (hit.length > 0) {
+            const hitNormal = hit[0].face.normal.clone().normalize();
+            const normalAlignment = hitNormal.dot(normal);
+            const distToPlane = Math.abs(hit[0].point.distanceTo(testPoint));
+
+            if (normalAlignment > normalDotThreshold && distToPlane < planeTolerance) {
+                // Valid point on our face
+                samplePoints.add(JSON.stringify({
+                    x: current.x * gridSize,
+                    y: current.y * gridSize,
+                    point: hit[0].point
+                }));
+                
+                // Add neighbors to check
+                const neighbors = [
+                    { x: current.x + 1, y: current.y },
+                    { x: current.x - 1, y: current.y },
+                    { x: current.x, y: current.y + 1 },
+                    { x: current.x, y: current.y - 1 }
+                ];
+                
+                for (const neighbor of neighbors) {
+                    const key = `${neighbor.x},${neighbor.y}`;
+                    if (!checkedPoints.has(key)) {
+                        pointsToCheck.add(JSON.stringify({
+                            ...neighbor,
+                            normal: hitNormal
+                        }));
+                    }
+                }
+            }
+        }
+        
+        if (checkedPoints.size > 10000) break;
+    }
+
+    if (samplePoints.size < 3) return null;
+
+    // Find bounds of sampled points
+    let minX = Infinity, maxX = -Infinity;
+    let minY = Infinity, maxY = -Infinity;
+
+    for (const pointStr of samplePoints) {
+        const p = JSON.parse(pointStr);
+        minX = Math.min(minX, p.x);
+        maxX = Math.max(maxX, p.x);
+        minY = Math.min(minY, p.y);
+        maxY = Math.max(maxY, p.y);
+    }
+
+    // Calculate dimensions
+    const width = maxX - minX;
+    const height = maxY - minY;
+    const centerX = (minX + maxX) / 2;
+    const centerY = (minY + maxY) / 2;
+
+    // Create highlight group
+    const highlightGroup = new THREE.Group();
+    const planeGeom = new THREE.PlaneGeometry(width, height);
+    const planeMat = new THREE.MeshBasicMaterial({
+        color: color,
+        transparent: true,
+        opacity: opacity,
+        side: THREE.DoubleSide,
+        depthTest: true
+    });
+    const highlight = new THREE.Mesh(planeGeom, planeMat);
+    
+    // Add border
+    const edgeGeom = new THREE.EdgesGeometry(planeGeom);
+    const edgeMat = new THREE.LineBasicMaterial({
+        color: 0x000000,
+        linewidth: 2,
+        opacity: 0.8,
+        transparent: true
+    });
+    const edges = new THREE.LineSegments(edgeGeom, edgeMat);
+
+    highlightGroup.add(highlight);
+    highlightGroup.add(edges);
+
+    // Position highlight
+    const centerPoint = point.clone().add(
+        basis.tangent.clone().multiplyScalar(centerX)
+    ).add(
+        basis.bitangent.clone().multiplyScalar(centerY)
+    );
+    highlightGroup.position.copy(centerPoint);
+
+    // Orient highlight
+    const rotMatrix = new THREE.Matrix4();
+    rotMatrix.makeBasis(basis.tangent, basis.bitangent, basis.normal);
+    highlightGroup.setRotationFromMatrix(rotMatrix);
+
+    // Store dimensions
+    const dimensions = {
+        width: Math.abs(width),
+        height: Math.abs(height),
+        center2D: { x: centerX, y: centerY },
+        bounds2D: {
+            min: { x: minX, y: minY },
+            max: { x: maxX, y: maxY }
+        }
+    };
+    highlightGroup.userData.dimensions = dimensions;
+
+    return highlightGroup;
+}
+// Function to update the UI with slide faces
+function updateSlideList() {
+    const container = document.getElementById('slideFaces');
+    if (!container) return;
+    
+    container.innerHTML = '<h3>Slide Faces:</h3>';
+    
+    slideFaces.forEach((face, index) => {
+        const faceDiv = document.createElement('div');
+        faceDiv.className = 'slide-face';
+        
+        const rotation = calculateRotation(face.normal);
+        faceDiv.innerHTML = `
+            Face ${index + 1}<br>
+            Normal: (${face.normal.x.toFixed(2)}, 
+                    ${face.normal.y.toFixed(2)}, 
+                    ${face.normal.z.toFixed(2)})<br>
+            Rotation: (${rotation.x}°, ${rotation.y}°, ${rotation.z}°)<br>
+            Size: ${face.dimensions.width.toFixed(2)}mm × ${face.dimensions.height.toFixed(2)}mm
+        `;
+        
+        const deleteBtn = document.createElement('button');
+        deleteBtn.className = 'delete-btn';
+        deleteBtn.innerHTML = '×';
+        deleteBtn.onclick = () => deleteSlideface(index);
+        
+        faceDiv.appendChild(deleteBtn);
+        container.appendChild(faceDiv);
+    });
+}
+
+// Function to delete a slide face
+function deleteSlideface(index) {
+    const face = slideFaces[index];
+    if (face.highlight) {
+        scene.remove(face.highlight);
+    }
+    
+    slideFaces.splice(index, 1);
+    updateSlideList();
+    updateStatus('Slide face deleted');
 }
 function toggleFaceSelection() {
     selectionMode = !selectionMode;
@@ -293,6 +604,58 @@ function calculateDistances(circles) {
     }
     return distances;
 }
+// Helper function to find connected vertices
+function findConnectedVertices(startIndex, positions, normal, tolerance) {
+    const connected = new Set([startIndex]);
+    const toCheck = [startIndex];
+    const vertex = new THREE.Vector3();
+    const checkVertex = new THREE.Vector3();
+    const worldMatrix = model.matrixWorld;
+    
+    while (toCheck.length > 0) {
+        const currentIndex = toCheck.pop();
+        vertex.fromBufferAttribute(positions, currentIndex);
+        vertex.applyMatrix4(worldMatrix);
+
+        // Check nearby vertices
+        for (let i = 0; i < positions.count; i++) {
+            if (connected.has(i)) continue;
+
+            checkVertex.fromBufferAttribute(positions, i);
+            checkVertex.applyMatrix4(worldMatrix);
+
+            // Check if vertex is on the same plane
+            const toPoint = checkVertex.clone().sub(vertex);
+            const dist = Math.abs(toPoint.dot(normal));
+
+            if (dist < tolerance) {
+                const distance = vertex.distanceTo(checkVertex);
+                if (distance < 2) { // Adjust this threshold as needed
+                    connected.add(i);
+                    toCheck.push(i);
+                }
+            }
+        }
+    }
+
+    return connected;
+}
+// Reconstructed deleteCircle function
+function deleteCircle(index) {
+    if (index < 0 || index >= detectedCircles.length) return;
+
+    // Remove the visual marker from the scene
+    if (detectedCircles[index].marker) {
+        scene.remove(detectedCircles[index].marker);
+    }
+
+    // Remove the circle from our array
+    detectedCircles.splice(index, 1);
+
+    // Update the UI
+    updateCircleList();
+    updateStatus('Circle deleted');
+}
 
 function detectCircle(point, normal, geometry) {
     // Create local coordinate system
@@ -490,6 +853,12 @@ function onModelClick(event) {
             return;
         }
 
+        if (slideFacesMode) {
+            // Handle slide face selection
+            addSlideface(faceNormal, point);
+            return;
+        }
+
         // Normal circle detection logic
         const circle = detectCircle(point, faceNormal, model.geometry);
 
@@ -544,6 +913,104 @@ function clearAllCircles() {
     detectedCircles = [];
     updateCircleList();
     updateStatus('All circles cleared');
+}
+function groupSlideFaces(faces) {
+    const groups = [];
+    const normalTolerance = 0.05;
+    const planeDistanceTolerance = 0.5;
+
+    faces.forEach((face) => {
+        let foundGroup = false;
+
+        for (const group of groups) {
+            const firstFace = group[0];
+            
+            if (firstFace.normal.dot(face.normal) > 0.99) {
+                const toPoint = face.point.clone().sub(firstFace.point);
+                const distanceToPlane = Math.abs(toPoint.dot(firstFace.normal));
+
+                if (distanceToPlane < planeDistanceTolerance) {
+                    group.push(face);
+                    foundGroup = true;
+                    break;
+                }
+            }
+        }
+
+        if (!foundGroup) {
+            groups.push([face]);
+        }
+    });
+
+    // Calculate distances between faces in each group
+    groups.forEach(group => {
+        if (group.length > 1) {
+            group.distances = [];
+            for (let i = 0; i < group.length; i++) {
+                for (let j = i + 1; j < group.length; j++) {
+                    // Calculate distance between faces
+                    const face1 = group[i];
+                    const face2 = group[j];
+                    
+                    // Create basis for face1
+                    const basis = createLocalBasis(face1.normal);
+                    
+                    // Project face2's center into face1's plane
+                    const face2Point = face2.point.clone().sub(face1.point);
+                    const face2Center = {
+                        x: face2Point.dot(basis.tangent),
+                        y: face2Point.dot(basis.bitangent)
+                    };
+                    
+                    // Calculate minimum distance between any edges
+                    const face1Edges = [
+                        { x1: face1.dimensions.bounds2D.min.x, y1: face1.dimensions.bounds2D.min.y, 
+                          x2: face1.dimensions.bounds2D.max.x, y2: face1.dimensions.bounds2D.min.y },
+                        { x1: face1.dimensions.bounds2D.max.x, y1: face1.dimensions.bounds2D.min.y,
+                          x2: face1.dimensions.bounds2D.max.x, y2: face1.dimensions.bounds2D.max.y },
+                        { x1: face1.dimensions.bounds2D.max.x, y1: face1.dimensions.bounds2D.max.y,
+                          x2: face1.dimensions.bounds2D.min.x, y2: face1.dimensions.bounds2D.max.y },
+                        { x1: face1.dimensions.bounds2D.min.x, y1: face1.dimensions.bounds2D.max.y,
+                          x2: face1.dimensions.bounds2D.min.x, y2: face1.dimensions.bounds2D.min.y }
+                    ];
+                    
+                    const face2Edges = [
+                        { x1: face2Center.x - face2.dimensions.width/2, y1: face2Center.y - face2.dimensions.height/2,
+                          x2: face2Center.x + face2.dimensions.width/2, y2: face2Center.y - face2.dimensions.height/2 },
+                        { x1: face2Center.x + face2.dimensions.width/2, y1: face2Center.y - face2.dimensions.height/2,
+                          x2: face2Center.x + face2.dimensions.width/2, y2: face2Center.y + face2.dimensions.height/2 },
+                        { x1: face2Center.x + face2.dimensions.width/2, y1: face2Center.y + face2.dimensions.height/2,
+                          x2: face2Center.x - face2.dimensions.width/2, y2: face2Center.y + face2.dimensions.height/2 },
+                        { x1: face2Center.x - face2.dimensions.width/2, y1: face2Center.y + face2.dimensions.height/2,
+                          x2: face2Center.x - face2.dimensions.width/2, y2: face2Center.y - face2.dimensions.height/2 }
+                    ];
+                    
+                    let minDist = Infinity;
+                    
+                    // Compare all edges
+                    for (const edge1 of face1Edges) {
+                        for (const edge2 of face2Edges) {
+                            const dist = Math.min(
+                                Math.sqrt(Math.pow(edge1.x1 - edge2.x1, 2) + Math.pow(edge1.y1 - edge2.y1, 2)),
+                                Math.sqrt(Math.pow(edge1.x1 - edge2.x2, 2) + Math.pow(edge1.y1 - edge2.y2, 2)),
+                                Math.sqrt(Math.pow(edge1.x2 - edge2.x1, 2) + Math.pow(edge1.y2 - edge2.y1, 2)),
+                                Math.sqrt(Math.pow(edge1.x2 - edge2.x2, 2) + Math.pow(edge1.y2 - edge2.y2, 2))
+                            );
+                            minDist = Math.min(minDist, dist);
+                        }
+                    }
+
+                    group.distances.push({
+                        from: i + 1,
+                        to: j + 1,
+                        distance: Math.round(minDist * 100) / 100
+                    });
+                }
+            }
+        }
+    });
+
+    return groups;
 }
 function groupHolesByFace(holes) {
     const groups = [];
@@ -814,6 +1281,7 @@ function exportCircleData() {
     }
 
     const faceGroups = groupHolesByFace(detectedCircles);
+    const slideFaceGroups = groupSlideFaces(slideFaces);
     
     const data = {
         faces: faceGroups.map((group, faceIndex) => {
@@ -843,14 +1311,38 @@ function exportCircleData() {
                 }))
             };
         }),
-        orientationFace: {
+        orientationFace: topFaceNormal ? {
             normal: {
                 x: Math.round(topFaceNormal.x * 100) / 100,
                 y: Math.round(topFaceNormal.y * 100) / 100,
                 z: Math.round(topFaceNormal.z * 100) / 100
             },
             rotation: calculateRotation(topFaceNormal)
-        },
+        } : null,
+        slideFaces: slideFaceGroups.map((group, groupIndex) => ({
+            groupId: groupIndex + 1,
+            faces: group.map((face, faceIndex) => ({
+                id: faceIndex + 1,
+                normal: {
+                    x: Math.round(face.normal.x * 100) / 100,
+                    y: Math.round(face.normal.y * 100) / 100,
+                    z: Math.round(face.normal.z * 100) / 100
+                },
+                rotation: calculateRotation(face.normal),
+                position: {
+                    x: Math.round(face.point.x * 100) / 100,
+                    y: Math.round(face.point.y * 100) / 100,
+                    z: Math.round(face.point.z * 100) / 100
+                },
+                dimensions: {
+                    width: face.dimensions.width,
+                    height: face.dimensions.height,
+                    center2D: face.dimensions.center2D,
+                    bounds2D: face.dimensions.bounds2D
+                }
+            })),
+            distances: group.distances || []
+        })),
         totalHoles: detectedCircles.length,
         timestamp: new Date().toISOString()
     };
